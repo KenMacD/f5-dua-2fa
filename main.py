@@ -3,17 +3,65 @@
 import re
 import sys
 from urllib.parse import parse_qs, urlparse
+from subprocess import check_output
 
+import pexpect
 import requests
 
+##########
+# Config #
+##########
+
+# Need a build with f5 support
+OPENCONNECT_PATH = "/home/user/src/openconnect/openconnect"
+
+# Some VPNs require a real user-agent
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:93.0) Gecko/20100101 Firefox/93.0"
 
-DUO_AUTH = "https://{api_domain}/frame/proxy/v1/auth"
-DUO_PROMPT = "https://{api_domain}/frame/prompt"
-DUO_STATUS = "https://{api_domain}/frame/status"
+VPN_URL = "https://vpn.example.org/"
+VPN_USER = "USER"
+VPN_PASS_CMD = "pass show vpn.example.org | head -n 1 | tr -d '\n'"
+
+DUO_AUTH = "https://{api_host}/frame/proxy/v1/auth"
+DUO_PROMPT = "https://{api_host}/frame/prompt"
+DUO_STATUS = "https://{api_host}/frame/status"
+DUO_PASSCODE_CMD = "ykman oath accounts code -s Duo | tr -d '\n'"
 
 
-def main(auth_url, passcode, duo_txid):
+def get_passwd():
+    return check_output(VPN_PASS_CMD, shell=True)
+
+
+def get_passcode():
+    return check_output(DUO_PASSCODE_CMD, shell=True)
+
+
+def connect():
+    p = pexpect.spawn(
+        OPENCONNECT_PATH,
+        [
+            "--protocol=f5",
+            "--useragent={}".format(USER_AGENT),
+            "--user={}".format(VPN_USER),
+            "--server={}".format(VPN_URL),
+            "--script-tun",
+            "--script=ocproxy -D 11080",
+        ],
+    )
+
+    # p.logfile = sys.stdout.buffer
+    p.expect("password:")
+    p.sendline(get_passwd())
+    p.expect("DUO-TXID\(([^|]+)\|([^)]+)\)")
+    (api, txid) = [x.decode("utf-8") for x in p.match.groups()]
+    p.expect("_F5_challenge:")
+
+    cookie = duo(f"{VPN_URL}my.policy", get_passcode(), api, txid)
+    p.sendline(cookie)
+    p.interact()
+
+
+def duo(parent_url, passcode, api_host, txid):
 
     session: requests.Session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
@@ -21,23 +69,20 @@ def main(auth_url, passcode, duo_txid):
         lambda response, *args, **kwargs: response.raise_for_status()
     ]
 
-    (api, txid) = re.search("DUO-TXID\(([^|]+)\|([^)]+)\)", duo_txid).groups()
-    # print(f"API: {api} txid: {txid}")
-
     # Get the DUO_AUTH url in order for the _xsrf cookie to be set
     session.get(
-        url=DUO_AUTH.format(api_domain=api),
+        url=DUO_AUTH.format(api_host=api_host),
         params={
             "proxy_txid": txid,
-            "parent": auth_url,
+            "parent": parent_url,
             "supports_duo_open_window": "true",
         },
     )
     rep = session.post(
-        url=DUO_AUTH.format(api_domain=api),
+        url=DUO_AUTH.format(api_host=api_host),
         data={
             "proxy_txid": txid,
-            "parent": auth_url,
+            "parent": parent_url,
             "java_version": "",
             "flash_version": "",
             "screen_resolution_width": 1920,
@@ -55,13 +100,12 @@ def main(auth_url, passcode, duo_txid):
     )
     # Request leads to a redirect with the require 'sid' as a queryparam
     sid = parse_qs(urlparse(rep.url).query)["sid"][0]
-    # print(sid)
 
     # TODO: make device and factor configurable.
     # TODO: support push
     # 'device' uses 'phoneX', not the name you set
     res = session.post(
-        url=DUO_PROMPT.format(api_domain=api),
+        url=DUO_PROMPT.format(api_host=api_host),
         data={
             "sid": sid,
             "device": "phone2",
@@ -78,7 +122,7 @@ def main(auth_url, passcode, duo_txid):
     txid = res["response"]["txid"]
 
     res = session.post(
-        url=DUO_STATUS.format(api_domain=api), data={"sid": sid, "txid": txid}
+        url=DUO_STATUS.format(api_host=api_host), data={"sid": sid, "txid": txid}
     )
     res = res.json()
     assert res["stat"] == "OK"
@@ -88,8 +132,8 @@ def main(auth_url, passcode, duo_txid):
     # TODO: loop on prompt/status if not yet done (ie for push)
 
     res = session.post(
-        url="https://{api_domain}{result_url}".format(
-            api_domain=api, result_url=result_url
+        url="https://{api_host}{result_url}".format(
+            api_host=api_host, result_url=result_url
         ),
         data={
             "sid": sid,
@@ -101,9 +145,10 @@ def main(auth_url, passcode, duo_txid):
     cookie = res["response"]["cookie"]
 
     print("Cookie: {}".format(cookie))
+    return cookie
 
     # res = session.post(
-    #     url=auth_url,
+    #     url=parent_url,
     #     data={
     #         "_F5_challenge": cookie,
     #         "vhost": "standard",
@@ -117,11 +162,4 @@ def main(auth_url, passcode, duo_txid):
 
 
 if __name__ == "__main__":
-
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} vpn_url hotp duo-txid")
-        print(
-            f"Example: {sys.argv[0]} http://vpn.example.org/my.policy 123456 DUO-TXID(api-1234abcd.duosecurity.com|AaAaAaAaAaAaAaAaAaAa)"
-        )
-    else:
-        main(*sys.argv[1:])
+    connect()
